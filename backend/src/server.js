@@ -10,12 +10,33 @@ import { authenticate, requireRole } from './middleware.js';
 
 const app = express();
 const PORT = Number(process.env.PORT || 5000);
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+  throw new Error('PORT must be an integer between 1 and 65535.');
+}
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+  throw new Error('Set JWT_SECRET to a private random value of at least 32 characters.');
+}
+if (!process.env.ADMIN_SETUP_SECRET || process.env.ADMIN_SETUP_SECRET.startsWith('replace-')) {
+  throw new Error('Set a private ADMIN_SETUP_SECRET before starting the API.');
+}
+if (process.env.NODE_ENV === 'production' && !process.env.FRONTEND_URL) {
+  throw new Error('Set FRONTEND_URL to the deployed frontend origin in production.');
+}
 app.use(helmet());
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173' }));
 app.use(express.json({ limit: '7mb' }));
 
 const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
-const validEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || ''));
+const validEmail = (email) => typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+const validDateOfBirth = (value) => {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(date.valueOf()) &&
+    date.toISOString().slice(0, 10) === value &&
+    value <= new Date().toISOString().slice(0, 10);
+};
+const isText = (value, maxLength) =>
+  typeof value === 'string' && value.trim().length > 0 && value.trim().length <= maxLength;
 const setting = async (key) => {
   const [rows] = await pool.execute('SELECT setting_value FROM settings WHERE setting_key = ?', [key]);
   return rows[0]?.setting_value ?? null;
@@ -34,8 +55,7 @@ app.get('/api/health', asyncRoute(async (_req, res) => {
 
 app.get('/api/public/site', asyncRoute(async (_req, res) => {
   const [announcements] = await pool.execute(
-    'SELECT id, title, body, created_at FROM announcements WHERE published = TRUE AND audience = ? OR published = TRUE AND audience = ? ORDER BY created_at DESC LIMIT 8',
-    ['all', 'students']
+    "SELECT id, title, body, created_at FROM announcements WHERE published = TRUE AND audience = 'all' ORDER BY created_at DESC LIMIT 8"
   );
   res.json({
     schoolName: await setting('school_name'),
@@ -47,25 +67,39 @@ app.get('/api/public/site', asyncRoute(async (_req, res) => {
 
 app.post('/api/auth/setup-admin', asyncRoute(async (req, res) => {
   const { setupSecret, fullName, email, password } = req.body || {};
-  if (!process.env.ADMIN_SETUP_SECRET || process.env.ADMIN_SETUP_SECRET.startsWith('replace-')) {
-    return res.status(503).json({ message: 'Set a private ADMIN_SETUP_SECRET in backend/.env first.' });
+  if (typeof setupSecret !== 'string') {
+    return res.status(403).json({ message: 'Setup secret is incorrect.' });
   }
   const suppliedSecret = Buffer.from(String(setupSecret || ''), 'utf8');
   const expectedSecret = Buffer.from(String(process.env.ADMIN_SETUP_SECRET), 'utf8');
   if (suppliedSecret.length !== expectedSecret.length || !crypto.timingSafeEqual(suppliedSecret, expectedSecret)) {
     return res.status(403).json({ message: 'Setup secret is incorrect.' });
   }
-  const [existing] = await pool.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1");
-  if (existing.length) return res.status(409).json({ message: 'First-admin setup is already locked.' });
-  if (!fullName?.trim() || !validEmail(email) || typeof password !== 'string' || password.length < 12) {
+  if (!isText(fullName, 150) || !isText(email, 190) || !validEmail(email) || typeof password !== 'string' || password.length < 12) {
     return res.status(400).json({ message: 'Enter your name, a valid email, and a password of at least 12 characters.' });
   }
-  const hash = await bcrypt.hash(password, 12);
-  const [result] = await pool.execute(
-    "INSERT INTO users (full_name, email, password_hash, role) VALUES (?, ?, ?, 'admin')",
-    [fullName.trim(), email.trim().toLowerCase(), hash]
-  );
-  res.status(201).json({ message: 'First admin created. You can now log in.', userId: result.insertId });
+  const connection = await pool.getConnection();
+  const lockName = 'ghsk-first-admin-setup';
+  try {
+    const [[lock]] = await connection.query('SELECT GET_LOCK(?, 5) AS acquired', [lockName]);
+    if (lock.acquired !== 1) {
+      return res.status(503).json({ message: 'Administrator setup is busy. Please try again.' });
+    }
+    const [existing] = await connection.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1");
+    if (existing.length) return res.status(409).json({ message: 'First-admin setup is already locked.' });
+    const hash = await bcrypt.hash(password, 12);
+    const [result] = await connection.execute(
+      "INSERT INTO users (full_name, email, password_hash, role) VALUES (?, ?, ?, 'admin')",
+      [fullName.trim(), email.trim().toLowerCase(), hash]
+    );
+    res.status(201).json({ message: 'First admin created. You can now log in.', userId: result.insertId });
+  } finally {
+    try {
+      await connection.query('SELECT RELEASE_LOCK(?)', [lockName]);
+    } finally {
+      connection.release();
+    }
+  }
 }));
 
 app.post('/api/auth/login', asyncRoute(async (req, res) => {
@@ -94,10 +128,20 @@ app.get('/api/auth/me', authenticate, asyncRoute(async (req, res) => {
 app.post('/api/admissions', asyncRoute(async (req, res) => {
   if ((await setting('admissions_open')) !== 'true') return res.status(403).json({ message: 'Admissions are currently closed.' });
   const b = req.body || {};
-  const required = ['studentName','dateOfBirth','gender','applyingClass','guardianName','guardianRelation','guardianPhone','address'];
-  if (required.some(k => !String(b[k] || '').trim())) return res.status(400).json({ message: 'Please complete all required fields.' });
+  if (
+    !isText(b.studentName, 150) ||
+    !validDateOfBirth(b.dateOfBirth) ||
+    !isText(b.applyingClass, 30) ||
+    !isText(b.guardianName, 150) ||
+    !isText(b.guardianRelation, 60) ||
+    !isText(b.guardianPhone, 30) ||
+    !isText(b.address, 4000) ||
+    (b.previousSchool != null && b.previousSchool !== '' && !isText(b.previousSchool, 180))
+  ) return res.status(400).json({ message: 'Please complete the required fields with valid values.' });
   if (!['male','female','other'].includes(b.gender)) return res.status(400).json({ message: 'Select a valid gender option.' });
-  if (b.guardianEmail && !validEmail(b.guardianEmail)) return res.status(400).json({ message: 'Guardian email is not valid.' });
+  if (b.guardianEmail && (typeof b.guardianEmail !== 'string' || !isText(b.guardianEmail, 190) || !validEmail(b.guardianEmail))) {
+    return res.status(400).json({ message: 'Guardian email is not valid.' });
+  }
   const applicationNo = `GHSKR-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
   await pool.execute(
     `INSERT INTO admission_applications
@@ -154,8 +198,9 @@ app.get('/api/admin/announcements', authenticate, requireRole('admin'), asyncRou
 
 app.post('/api/admin/announcements', authenticate, requireRole('admin'), asyncRoute(async (req, res) => {
   const { title, body, audience = 'all', published = true } = req.body || {};
-  if (!title?.trim() || !body?.trim()) return res.status(400).json({ message: 'Title and announcement text are required.' });
+  if (!isText(title, 180) || !isText(body, 4000)) return res.status(400).json({ message: 'Title and announcement text are required.' });
   if (!['all','students','teachers'].includes(audience)) return res.status(400).json({ message: 'Invalid audience.' });
+  if (typeof published !== 'boolean') return res.status(400).json({ message: 'Published must be true or false.' });
   const [result] = await pool.execute(
     'INSERT INTO announcements (title, body, audience, published, created_by) VALUES (?, ?, ?, ?, ?)',
     [title.trim(), body.trim(), audience, Boolean(published), req.user.id]

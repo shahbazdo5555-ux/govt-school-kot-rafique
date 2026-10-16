@@ -83,3 +83,18 @@ Never share the setup secret or admin password. If the first-admin setup endpoin
 - API endpoints enforce roles on the server.
 - Student applications contain personal information: restrict database access and only collect information needed by the school.
 - This starter does not yet implement production-grade email verification, password-reset email delivery, MFA, or deployment automation. Assignment uploads are stored in MySQL and are limited to 5 MB per file.
+
+## Production deployment checklist
+
+Deploy the API, frontend, and MySQL database as separate services. Do not upload either `.env` file or commit real credentials.
+
+1. Create a managed MySQL 8 database, allow connections from the API service, and run `backend/database/schema.sql` and `backend/database/upgrade-learning-portal.sql` once each.
+2. Deploy `backend/` as a Node.js service. Use `npm ci` to install and `npm start` to run it. Configure these environment variables in the hosting provider's secret/configuration panel:
+   - `NODE_ENV=production`
+   - `PORT` (use the port supplied by the host)
+   - `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME` for the managed database
+   - `JWT_SECRET` as a private random value with at least 32 characters
+   - `ADMIN_SETUP_SECRET` as a private one-time setup phrase; do not use a sample or public value
+   - `FRONTEND_URL` as the exact HTTPS origin of the deployed frontend (no API path)
+3. Deploy `frontend/` as a static site. Set `VITE_API_BASE_URL` to the deployed API URL ending in `/api` before building, then run `npm ci` and `npm run build`; publish the `dist/` directory. Configure the static host to rewrite unknown paths to `index.html` so routes such as `/login`, `/admissions`, and `/dashboard` work when opened directly.
+4. Check `https://<your-api-host>/api/health`, then open the deployed `/setup-admin` page and create the first administrator using the configured setup secret. Keep the API and database private except for required web traffic; use HTTPS, backups, monitoring, and rate limiting before accepting real student data.
